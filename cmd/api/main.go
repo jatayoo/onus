@@ -44,6 +44,17 @@ type CreateJobResponse struct {
 	State string `json:"state"`
 }
 
+type GetJobResponse struct {
+	JobID          string                 `json:"job_id"`
+	ClientID       string                 `json:"client_id"`
+	IdempotencyKey string                 `json:"idempotency_key"`
+	JobType        string                 `json:"job_type"`
+	Spec           map[string]interface{} `json:"spec"`
+	State          string                 `json:"state"`
+	CreatedAt      time.Time              `json:"created_at"`
+	UpdatedAt      time.Time              `json:"updated_at"`
+}
+
 type Job struct {
 	JobID          string
 	ClientID       string
@@ -334,6 +345,84 @@ func CreateJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func GetJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := GetLogger(r.Context())
+
+		jobID := chi.URLParam(r, "jobID")
+
+		if _, err := uuid.Parse(jobID); err != nil {
+			logger.Warn("invalid job_id format",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, map[string]string{"error": "invalid job_id format"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		query := `
+		SELECT job_id, client_id, job_type, spec, state, created_at, updated_at
+		FROM jobs
+		WHERE job_id = $1
+		`
+
+		var job GetJobResponse
+		var specJSON []byte
+
+		err := pool.QueryRow(ctx, query, jobID).Scan(
+			&job.JobID,
+			&job.ClientID,
+			&job.JobType,
+			&specJSON,
+			&job.State,
+			&job.CreatedAt,
+			&job.UpdatedAt,
+		)
+
+		if err != nil {
+
+			if err.Error() == "no rows in result set" {
+				logger.Warn("job not found",
+					zap.String("job_id", jobID),
+				)
+				render.Status(r, http.StatusNotFound)
+				render.JSON(w, r, map[string]string{"error": "job not found"})
+				return
+			}
+
+			logger.Error("failed to fetch job",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to fetch job"})
+			return
+		}
+
+		if err := json.Unmarshal(specJSON, &job.Spec); err != nil {
+			logger.Error("failed to unmarshal spec JSON",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to process job data"})
+			return
+		}
+
+		logger.Info("job fetched successfully",
+			zap.String("job_id", job.JobID),
+			zap.String("state", job.State),
+		)
+
+		render.Status(r, http.StatusOK)
+		render.JSON(w, r, job)
+	}
+}
+
 func generateRequestHash(jobType string, spec map[string]interface{}) string {
 	data := struct {
 		JobType string                 `json:"job_type"`
@@ -435,6 +524,7 @@ func main() {
 	})
 
 	r.Post("/jobs", CreateJobHandler(pool))
+	r.Get("/jobs/{jobID}", GetJobHandler(pool))
 
 	logger.Info("Starting http server",
 		zap.String("address", ":8080"),
