@@ -44,6 +44,30 @@ type CreateJobResponse struct {
 	State string `json:"state"`
 }
 
+type SubmitArtifactRequest struct {
+	Type    string                 `json:"type"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+type SubmitArtifactResponse struct {
+	JobID     string                 `json:"job_id"`
+	Type      string                 `json:"type"`
+	Payload   map[string]interface{} `json:"payload"`
+	CreatedAt time.Time              `json:"created_at"`
+}
+
+type GetArtifactsResponse struct {
+	JobID     string           `json:"job_id"`
+	Artifacts []ArtifactDetail `json:"artifacts"`
+}
+
+type ArtifactDetail struct {
+	Type      string                 `json:"type"`
+	Payload   map[string]interface{} `json:"payload"`
+	CreatedAt time.Time              `json:"created_at"`
+	UpdatedAt time.Time              `json:"updated_at"`
+}
+
 type GetJobResponse struct {
 	JobID          string                 `json:"job_id"`
 	ClientID       string                 `json:"client_id"`
@@ -423,6 +447,245 @@ func GetJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func SubmitArtifactHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := GetLogger(r.Context())
+
+		jobID := chi.URLParam(r, "jobID")
+
+		if _, err := uuid.Parse(jobID); err != nil {
+			logger.Warn("invalid job_id format",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, map[string]string{"error": "invalid job_id format"})
+			return
+		}
+
+		var req SubmitArtifactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			logger.Warn("invalid request body", zap.Error(err))
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		if req.Type == "" {
+			logger.Warn("missing artifact type in request")
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, map[string]string{"error": "missing artifact type"})
+			return
+		}
+
+		if req.Payload == nil {
+			req.Payload = make(map[string]interface{})
+		}
+
+		logger.Info("submitting artifact",
+			zap.String("job_id", jobID),
+			zap.String("artifact_type", req.Type),
+		)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		payloadJSON, err := json.Marshal(req.Payload)
+		if err != nil {
+			logger.Error("failed to marshal payload", zap.Error(err))
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to process request"})
+			return
+		}
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			logger.Error("failed to begin transaction", zap.Error(err))
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "database error"})
+			return
+		}
+		defer tx.Rollback(ctx)
+
+		var jobExists bool
+		err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = $1)", jobID).Scan(&jobExists)
+		if err != nil {
+			logger.Error("failed to check job existence", zap.Error(err))
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "database error"})
+			return
+		}
+
+		if !jobExists {
+			logger.Warn("job not found for artifact submission", zap.String("job_id", jobID))
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, map[string]string{"error": "job not found"})
+			return
+		}
+
+		query := `
+			INSERT INTO artifacts (job_id, type, payload)
+			VALUES ($1, $2, $3::jsonb)
+			ON CONFLICT (job_id, type)
+			DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+			RETURNING created_at;
+		`
+
+		var createdAt time.Time
+		err = tx.QueryRow(ctx, query, jobID, req.Type, payloadJSON).Scan(&createdAt)
+		if err != nil {
+			logger.Error("failed to insert/update artifact",
+				zap.Error(err),
+				zap.String("job_id", jobID),
+				zap.String("type", req.Type),
+			)
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to submit artifact"})
+			return
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			logger.Error("failed to commit transaction", zap.Error(err))
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "database error"})
+			return
+		}
+
+		logger.Info("artifact submitted successfully",
+			zap.String("job_id", jobID),
+			zap.String("type", req.Type),
+		)
+
+		response := SubmitArtifactResponse{
+			JobID:     jobID,
+			Type:      req.Type,
+			Payload:   req.Payload,
+			CreatedAt: createdAt,
+		}
+
+		render.Status(r, http.StatusOK)
+		render.JSON(w, r, response)
+	}
+}
+
+func GetArtifactsHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := GetLogger(r.Context())
+
+		jobID := chi.URLParam(r, "jobID")
+
+		// Validate job_id is a valid UUID
+		if _, err := uuid.Parse(jobID); err != nil {
+			logger.Warn("invalid job_id format",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, map[string]string{"error": "invalid job_id format"})
+			return
+		}
+
+		logger.Info("fetching artifacts",
+			zap.String("job_id", jobID),
+		)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		var jobExists bool
+		err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = $1)", jobID).Scan(&jobExists)
+		if err != nil {
+			logger.Error("failed to check job existence", zap.Error(err))
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "database error"})
+			return
+		}
+
+		if !jobExists {
+			logger.Warn("job not found for artifact retrieval", zap.String("job_id", jobID))
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, map[string]string{"error": "job not found"})
+			return
+		}
+
+		query := `
+		SELECT type, payload, created_at, updated_at
+		FROM artifacts
+		WHERE job_id = $1
+		ORDER BY created_at ASC
+		`
+
+		rows, err := pool.Query(ctx, query, jobID)
+		if err != nil {
+			logger.Error("failed to fetch artifacts",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to fetch artifacts"})
+			return
+		}
+		defer rows.Close()
+
+		artifacts := []ArtifactDetail{}
+		for rows.Next() {
+			var artifact ArtifactDetail
+			var payloadJSON []byte
+
+			err := rows.Scan(
+				&artifact.Type,
+				&payloadJSON,
+				&artifact.CreatedAt,
+				&artifact.UpdatedAt,
+			)
+			if err != nil {
+				logger.Error("failed to scan artifact row",
+					zap.String("job_id", jobID),
+					zap.Error(err),
+				)
+				render.Status(r, http.StatusInternalServerError)
+				render.JSON(w, r, map[string]string{"error": "Failed to process artifacts"})
+				return
+			}
+
+			if err := json.Unmarshal(payloadJSON, &artifact.Payload); err != nil {
+				logger.Error("failed to unmarshal artifact payload",
+					zap.String("job_id", jobID),
+					zap.Error(err),
+				)
+				render.Status(r, http.StatusInternalServerError)
+				render.JSON(w, r, map[string]string{"error": "Failed to process artifacts"})
+				return
+			}
+
+			artifacts = append(artifacts, artifact)
+		}
+
+		if err := rows.Err(); err != nil {
+			logger.Error("error iterating artifact rows",
+				zap.String("job_id", jobID),
+				zap.Error(err),
+			)
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, map[string]string{"error": "Failed to fetch artifacts"})
+			return
+		}
+
+		logger.Info("artifacts fetched successfully",
+			zap.String("job_id", jobID),
+			zap.Int("artifact_count", len(artifacts)),
+		)
+
+		response := GetArtifactsResponse{
+			JobID:     jobID,
+			Artifacts: artifacts,
+		}
+
+		render.Status(r, http.StatusOK)
+		render.JSON(w, r, response)
+	}
+}
+
 func generateRequestHash(jobType string, spec map[string]interface{}) string {
 	data := struct {
 		JobType string                 `json:"job_type"`
@@ -525,6 +788,7 @@ func main() {
 
 	r.Post("/jobs", CreateJobHandler(pool))
 	r.Get("/jobs/{jobID}", GetJobHandler(pool))
+	r.Post("/jobs/{jobID}/artifacts", SubmitArtifactHandler(pool))
 
 	logger.Info("Starting http server",
 		zap.String("address", ":8080"),
